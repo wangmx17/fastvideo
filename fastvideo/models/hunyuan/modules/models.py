@@ -350,7 +350,7 @@ class MMDoubleStreamBlock(nn.Module):
 
         # attention computation end
 
-        img_attn, txt_attn = attn[:, :img.shape[1]], attn[:, img.shape[1]:]
+        img_attn, txt_attn = attn.split([img.shape[1], attn.shape[1] - img.shape[1]], dim=1)
 
         # Calculate the img blocks.
         img: torch.Tensor = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
@@ -459,7 +459,7 @@ class MMSingleStreamBlock(nn.Module):
         q = rearrange(q, "B L (H D) -> B L H D", H=self.heads_num)
         qkv_type = q.dtype
         q = self.q_norm(q).to(qkv_type)
-        img_q, txt_q = q[:, :-txt_len, :, :], q[:, -txt_len:, :, :]
+        img_q, txt_q = q.split([q.shape[1] - txt_len, txt_len], dim=1)
         img_qq = apply_rotary_emb_single(img_q, freqs_cis, head_first=False, use_fused_rope=self.use_fused_rope)
         assert img_qq.shape == img_q.shape, f"img_qq: {img_qq.shape}, img_q: {img_q.shape}"
         img_q = img_qq
@@ -472,7 +472,7 @@ class MMSingleStreamBlock(nn.Module):
         k: torch.Tensor = self.linear_k(x_mod)
         k = rearrange(k, "B L (H D) -> B L H D", H=self.heads_num)
         k = self.k_norm(k).to(qkv_type)
-        img_k, txt_k = k[:, :-txt_len, :, :], k[:, -txt_len:, :, :]
+        img_k, txt_k = k.split([k.shape[1] - txt_len, txt_len], dim=1)
         img_kk = apply_rotary_emb_single(img_k, freqs_cis, head_first=False, use_fused_rope=self.use_fused_rope)
         assert img_kk.shape == img_k.shape, f"img_kk: {img_kk.shape}, img_k: {img_k.shape}"
         img_k = img_kk
@@ -485,7 +485,7 @@ class MMSingleStreamBlock(nn.Module):
         v: torch.Tensor = self.linear_v(x_mod)
         mlp = self.linear_mlp(x_mod)
         v = rearrange(v, "B L (H D) -> B L H D", H=self.heads_num)
-        img_v, txt_v = v[:, :-txt_len, :, :], v[:, -txt_len:, :, :]
+        img_v, txt_v = v.split([v.shape[1] - txt_len, txt_len], dim=1)
         value, encoder_value = img_v, txt_v
         
 
@@ -560,8 +560,7 @@ class MMSingleStreamBlock(nn.Module):
         # linear2.weight: [hidden_size, hidden_size + mlp_hidden_dim]
         W = self.linear2.weight
         b2 = self.linear2.bias
-        W_attn = W[:, : self.hidden_size]
-        W_mlp = W[:, self.hidden_size :]
+        W_attn, W_mlp = W.split([self.hidden_size, W.shape[1] - self.hidden_size], dim=1)
 
         output = torch.nn.functional.linear(attn, W_attn, b2) + torch.nn.functional.linear(mlp_act, W_mlp, None)
         return x + apply_gate(output, gate=mod_gate)

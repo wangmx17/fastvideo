@@ -289,6 +289,96 @@ def transpose_all2all_output(all2all_input, all2all_output, scatter_idx=2, gathe
         raise RuntimeError("scatter_idx must be 1 or 2 and gather_idx must be 1 or 2")
 
 
+def _get_ce_comm():
+    global _GLOBAL_CE_COMM, group
+    if group is None:
+        group = mccl_info.group
+    if _GLOBAL_CE_COMM is None:
+        _GLOBAL_CE_COMM = CeComm(group=group, rank=dist.get_rank(group=group), num_ranks=dist.get_world_size(group=group))
+    return _GLOBAL_CE_COMM
+
+
+class CePending:
+    """Completion event of one reverse (gradient) all2all launched on the CE stream."""
+
+    def __init__(self):
+        self.event = None
+
+
+def ce_launch_seq_to_head(x, alloc_id, async_op):
+    """Forward all2all (scatter heads, gather sequence) outside autograd; returns the raw CE output buffer
+    laid out as (P, seqlen/P, bs, hc/P, hs)."""
+    ce_comm = _get_ce_comm()
+    P = torch.distributed.get_world_size(group)
+    bs, shard_seq_len, hc, hs = x.shape
+    with torch.no_grad():
+        input_t = x.reshape(bs, shard_seq_len, P, hc // P, hs).transpose(0, 2)
+        sizes = list(input_t.size())
+        strides = [1] * len(sizes)
+        for i in range(len(sizes) - 2, -1, -1):
+            strides[i] = sizes[i + 1] * strides[i + 1]
+        a2a_in = ce_comm.alloc_tensor(sizes=sizes, strides=strides, dtype=input_t.dtype, alloc_id=alloc_id)
+        a2a_in.copy_(input_t)
+        a2a_out = torch.empty_like(a2a_in, device="musa")
+        ce_comm.all_to_all_single(a2a_out, a2a_in, async_op=async_op)
+    return a2a_out
+
+
+class CeGradWait(torch.autograd.Function):
+    """Identity in forward. In backward, the compute stream waits for the pending reverse all2all that
+    produced this gradient, then materializes it contiguously (same layout as the synchronous path)."""
+
+    @staticmethod
+    def forward(ctx, x, pending):
+        ctx.pending = pending
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        torch.musa.current_stream().wait_event(ctx.pending.event)
+        ctx.pending.event = None
+        return grad.contiguous(), None
+
+
+class CeSeqToHeadCat(torch.autograd.Function):
+    """Forward: copy the raw all2all buffer (already communicated) transposed into cat([x_full, encoder], 1).
+    Backward: launch the reverse all2all for the sequence part on the CE stream without blocking the
+    compute stream; CeGradWait on the forward input performs the wait right before the gradient is used."""
+
+    @staticmethod
+    def forward(ctx, x_shard, raw, encoder_state, pending, alloc_id):
+        P = torch.distributed.get_world_size(group)
+        bs, shard_seq_len, hc, hs = x_shard.shape
+        seqlen, shard_hc = shard_seq_len * P, hc // P
+        src = raw.reshape(seqlen, bs, shard_hc, hs).transpose(0, 1)
+        out = torch.empty((bs, seqlen + encoder_state.shape[1], shard_hc, hs), dtype=src.dtype, device=src.device)
+        out[:, :seqlen].copy_(src)
+        out[:, seqlen:].copy_(encoder_state)
+        ctx.meta = (P, seqlen, pending, alloc_id)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        P, seqlen, pending, alloc_id = ctx.meta
+        g = grad[:, :seqlen]
+        bs, _, shard_hc, hs = g.shape
+        hc, shard_seqlen = shard_hc * P, seqlen // P
+        ce_comm = _get_ce_comm()
+        input_t = g.reshape(bs, P, shard_seqlen, shard_hc, hs).transpose(0, 3).transpose(0, 1)
+        sizes = list(input_t.size())
+        strides = [1] * len(sizes)
+        for i in range(len(sizes) - 2, -1, -1):
+            strides[i] = sizes[i + 1] * strides[i + 1]
+        a2a_in = ce_comm.alloc_tensor(sizes=sizes, strides=strides, dtype=input_t.dtype, alloc_id=alloc_id)
+        a2a_in.copy_(input_t)
+        a2a_out = torch.empty_like(a2a_in, device="musa")
+        ce_comm.all_to_all_single(a2a_out, a2a_in, async_op=True)
+        pending.event = torch.musa.Event()
+        pending.event.record(ce_comm.comm_stream)
+        d_shard = a2a_out.reshape(hc, shard_seqlen, bs, hs).transpose(0, 2)
+        return d_shard, None, grad[:, seqlen:], None, None
+
+
 def parallel_attention(q, k, v, img_q_len, img_kv_len, text_mask, mask_strategy=None):
     query, encoder_query = q
     key, encoder_key = k

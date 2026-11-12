@@ -10,7 +10,8 @@ from fastvideo.models.hunyuan.modules.posemb_layers import get_nd_rotary_pos_emb
 from fastvideo.utils.parallel_states import mccl_info
 
 from .activation_layers import get_activation_layer
-from .attenion import parallel_attention, tile, untile, specific_all_to_all_4D, transpose_all2all_output
+from .attenion import (parallel_attention, tile, untile, specific_all_to_all_4D, transpose_all2all_output, USE_CE, CePending,
+                       CeGradWait, CeSeqToHeadCat, ce_launch_seq_to_head)
 from .embed_layers import PatchEmbed, TextProjection, TimestepEmbedder
 from .mlp_layers import MLP, FinalLayer, MLPEmbedder
 from .modulate_layers import ModulateDiT, apply_gate, modulate
@@ -265,8 +266,14 @@ class MMDoubleStreamBlock(nn.Module):
             img_q = apply_rotary_emb_single(img_q, freqs_cis, head_first=False, use_fused_rope=self.use_fused_rope)
         
         query, encoder_query = img_q, txt_q
+        ce_async = USE_CE and get_sequence_parallel_state() and mask_strategy[0] is None
+        if ce_async:
+            pending_q = CePending()
+            query = CeGradWait.apply(query, pending_q)
         query_input = query
-        if get_sequence_parallel_state():
+        if ce_async:
+            query_raw = ce_launch_seq_to_head(query, 0, async_op=True)
+        elif get_sequence_parallel_state():
             query_raw = specific_all_to_all_4D(query, scatter_idx=2, gather_idx=1, alloc_id=0, async_op=True)
         
         # Compute img_k while Q is being communicated
@@ -279,8 +286,13 @@ class MMDoubleStreamBlock(nn.Module):
             img_k = apply_rotary_emb_single(img_k, freqs_cis, head_first=False, use_fused_rope=self.use_fused_rope)
         
         key, encoder_key = img_k, txt_k
+        if ce_async:
+            pending_k = CePending()
+            key = CeGradWait.apply(key, pending_k)
         key_input = key
-        if get_sequence_parallel_state():
+        if ce_async:
+            key_raw = ce_launch_seq_to_head(key, 1, async_op=True)
+        elif get_sequence_parallel_state():
             key_raw = specific_all_to_all_4D(key, scatter_idx=2, gather_idx=1, alloc_id=1, async_op=True)
         
         # Compute img_v while K is being communicated
@@ -292,11 +304,12 @@ class MMDoubleStreamBlock(nn.Module):
 
         if get_sequence_parallel_state():
             # V sync acts as implicit barrier for Q/K
-            value = specific_all_to_all_4D(value, scatter_idx=2, gather_idx=1, alloc_id=2, async_op=False)
-            # Now Q/K comms are guaranteed complete, transpose their buffers
-            query = transpose_all2all_output(query_input, query_raw, scatter_idx=2, gather_idx=1, group=mccl_info.group)
-            key = transpose_all2all_output(key_input, key_raw, scatter_idx=2, gather_idx=1, group=mccl_info.group)
-
+            if ce_async:
+                pending_v = CePending()
+                value_input = CeGradWait.apply(value, pending_v)
+                value_raw = ce_launch_seq_to_head(value_input, 2, async_op=False)
+            else:
+                value = specific_all_to_all_4D(value, scatter_idx=2, gather_idx=1, alloc_id=2, async_op=False)
             def shrink_head(encoder_state, dim):
                 local_heads = encoder_state.shape[dim] // mccl_info.sp_size
                 return encoder_state.narrow(dim, mccl_info.rank_within_group * local_heads, local_heads)
@@ -304,6 +317,15 @@ class MMDoubleStreamBlock(nn.Module):
             encoder_query = shrink_head(encoder_query, dim=2)
             encoder_key = shrink_head(encoder_key, dim=2)
             encoder_value = shrink_head(encoder_value, dim=2)
+            # Now Q/K comms are guaranteed complete, transpose their buffers
+            if ce_async:
+                query_cat = CeSeqToHeadCat.apply(query_input, query_raw, encoder_query, pending_q, 0)
+                key_cat = CeSeqToHeadCat.apply(key_input, key_raw, encoder_key, pending_k, 1)
+                value_cat = CeSeqToHeadCat.apply(value_input, value_raw, encoder_value, pending_v, 2)
+                query = query_cat[:, :query_cat.shape[1] - encoder_query.shape[1]]
+            else:
+                query = transpose_all2all_output(query_input, query_raw, scatter_idx=2, gather_idx=1, group=mccl_info.group)
+                key = transpose_all2all_output(key_input, key_raw, scatter_idx=2, gather_idx=1, group=mccl_info.group)
             # [b, s, h, d]
 
         sequence_length = query.size(1)
@@ -321,9 +343,12 @@ class MMDoubleStreamBlock(nn.Module):
 
             hidden_states = sliding_tile_attention(query, key, value, windows, text_length).transpose(1, 2)
         else:
-            query = torch.cat([query, encoder_query], dim=1)
-            key = torch.cat([key, encoder_key], dim=1)
-            value = torch.cat([value, encoder_value], dim=1)
+            if ce_async:
+                query, key, value = query_cat, key_cat, value_cat
+            else:
+                query = torch.cat([query, encoder_query], dim=1)
+                key = torch.cat([key, encoder_key], dim=1)
+                value = torch.cat([value, encoder_value], dim=1)
             hidden_states = flash_attn_no_pad_separate_qkv(
                 query, key, value,
                 causal=False, dropout_p=0.0, softmax_scale=None
@@ -464,8 +489,14 @@ class MMSingleStreamBlock(nn.Module):
         assert img_qq.shape == img_q.shape, f"img_qq: {img_qq.shape}, img_q: {img_q.shape}"
         img_q = img_qq
         query, encoder_query = img_q, txt_q
+        ce_async = USE_CE and get_sequence_parallel_state() and mask_strategy[0] is None
+        if ce_async:
+            pending_q = CePending()
+            query = CeGradWait.apply(query, pending_q)
         query_input = query
-        if get_sequence_parallel_state():
+        if ce_async:
+            query_raw = ce_launch_seq_to_head(query, 0, async_op=True)
+        elif get_sequence_parallel_state():
             query_raw = specific_all_to_all_4D(query, scatter_idx=2, gather_idx=1, alloc_id=0, async_op=True)
         
         
@@ -477,8 +508,13 @@ class MMSingleStreamBlock(nn.Module):
         assert img_kk.shape == img_k.shape, f"img_kk: {img_kk.shape}, img_k: {img_k.shape}"
         img_k = img_kk
         key, encoder_key = img_k, txt_k
+        if ce_async:
+            pending_k = CePending()
+            key = CeGradWait.apply(key, pending_k)
         key_input = key
-        if get_sequence_parallel_state():           
+        if ce_async:
+            key_raw = ce_launch_seq_to_head(key, 1, async_op=True)
+        elif get_sequence_parallel_state():
             key_raw = specific_all_to_all_4D(key, scatter_idx=2, gather_idx=1, alloc_id=1, async_op=True)
             
         
@@ -495,11 +531,12 @@ class MMSingleStreamBlock(nn.Module):
             # query_raw = specific_all_to_all_4D(query, scatter_idx=2, gather_idx=1, alloc_id=0, async_op=True)
             # key_raw = specific_all_to_all_4D(key, scatter_idx=2, gather_idx=1, alloc_id=1, async_op=True)
             # V sync acts as implicit barrier for Q/K
-            value = specific_all_to_all_4D(value, scatter_idx=2, gather_idx=1, alloc_id=2, async_op=False)
-            # Now Q/K comms are guaranteed complete, transpose their buffers
-            query = transpose_all2all_output(query_input, query_raw, scatter_idx=2, gather_idx=1, group=mccl_info.group)
-            key = transpose_all2all_output(key_input, key_raw, scatter_idx=2, gather_idx=1, group=mccl_info.group)
-
+            if ce_async:
+                pending_v = CePending()
+                value_input = CeGradWait.apply(value, pending_v)
+                value_raw = ce_launch_seq_to_head(value_input, 2, async_op=False)
+            else:
+                value = specific_all_to_all_4D(value, scatter_idx=2, gather_idx=1, alloc_id=2, async_op=False)
             def shrink_head(encoder_state, dim):
                 local_heads = encoder_state.shape[dim] // mccl_info.sp_size
                 return encoder_state.narrow(dim, mccl_info.rank_within_group * local_heads, local_heads)
@@ -507,6 +544,15 @@ class MMSingleStreamBlock(nn.Module):
             encoder_query = shrink_head(encoder_query, dim=2)
             encoder_key = shrink_head(encoder_key, dim=2)
             encoder_value = shrink_head(encoder_value, dim=2)
+            # Now Q/K comms are guaranteed complete, transpose their buffers
+            if ce_async:
+                query_cat = CeSeqToHeadCat.apply(query_input, query_raw, encoder_query, pending_q, 0)
+                key_cat = CeSeqToHeadCat.apply(key_input, key_raw, encoder_key, pending_k, 1)
+                value_cat = CeSeqToHeadCat.apply(value_input, value_raw, encoder_value, pending_v, 2)
+                query = query_cat[:, :query_cat.shape[1] - encoder_query.shape[1]]
+            else:
+                query = transpose_all2all_output(query_input, query_raw, scatter_idx=2, gather_idx=1, group=mccl_info.group)
+                key = transpose_all2all_output(key_input, key_raw, scatter_idx=2, gather_idx=1, group=mccl_info.group)
             # [b, s, h, d]
 
         sequence_length = query.size(1)
@@ -524,9 +570,12 @@ class MMSingleStreamBlock(nn.Module):
 
             hidden_states = sliding_tile_attention(query, key, value, windows, text_length).transpose(1, 2)
         else:
-            query = torch.cat([query, encoder_query], dim=1)
-            key = torch.cat([key, encoder_key], dim=1)
-            value = torch.cat([value, encoder_value], dim=1)
+            if ce_async:
+                query, key, value = query_cat, key_cat, value_cat
+            else:
+                query = torch.cat([query, encoder_query], dim=1)
+                key = torch.cat([key, encoder_key], dim=1)
+                value = torch.cat([value, encoder_value], dim=1)
             hidden_states = flash_attn_no_pad_separate_qkv(
                 query, key, value,
                 causal=False, dropout_p=0.0, softmax_scale=None

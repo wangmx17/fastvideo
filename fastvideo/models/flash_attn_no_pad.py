@@ -33,20 +33,21 @@ class FlashAttnSeparateQKVFunc(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         
-        # Direct call to low-level forward (same as packed version)
-        out, q_saved, k_saved, v_saved, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+        # FA 2.8.3.post3 private ABI returns out, lse, mask, and RNG state.
+        out, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q, k, v,
             dropout_p,
             softmax_scale,
             causal=causal,
-            window_size=(-1, -1),
+            window_size_left=-1,
+            window_size_right=-1,
             softcap=0.0,
             alibi_slopes=None,
             return_softmax=False,
         )
         
         # Save for backward (same as packed version)
-        ctx.save_for_backward(q_saved, k_saved, v_saved, out_padded, softmax_lse, rng_state)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, rng_state)
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -76,7 +77,8 @@ class FlashAttnSeparateQKVFunc(torch.autograd.Function):
             ctx.dropout_p,
             ctx.softmax_scale,
             ctx.causal,
-            (-1, -1),  # window_size
+            -1,        # window_size_left
+            -1,        # window_size_right
             0.0,       # softcap
             None,      # alibi_slopes
             False,     # deterministic
@@ -87,7 +89,8 @@ class FlashAttnSeparateQKVFunc(torch.autograd.Function):
             return x.contiguous() if x is not None and x.stride(-1) != 1 else x
         
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        dqkv = maybe_contiguous(dqkv.transpose(1, 3))
+        # post3 fills the supplied gradient buffers in BSHD layout.
+        dqkv = maybe_contiguous(dqkv)
         dq = dqkv[:,:,0,...]
         dk = dqkv[:,:,1,...]
         dv = dqkv[:,:,2,...]

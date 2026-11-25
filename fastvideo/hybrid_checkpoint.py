@@ -1,4 +1,5 @@
 import enum
+import os
 import warnings
 from collections import defaultdict
 from functools import partial
@@ -365,6 +366,104 @@ class _HybridCachedTorchDispatchMode(TorchDispatchMode):
         return out
 
 
+# Experimental Function-level entry for eager, deterministic checkpoint regions.
+from contextvars import ContextVar
+
+_AUTOGRAD_SAC_CONTEXT = ContextVar("fastvideo_autograd_sac", default=None)
+
+
+def register_autograd_sac_function(function_type):
+    if not isinstance(function_type, type) or not issubclass(function_type, torch.autograd.Function):
+        raise TypeError("Expected a torch.autograd.Function subclass")
+    _save_list.add(function_type)
+
+
+def _autograd_signature(args, kwargs):
+    def metadata(value):
+        if isinstance(value, torch.Tensor):
+            return (tuple(value.shape), tuple(value.stride()), value.dtype, value.device)
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        raise TypeError("Unsupported Function-cache argument type: " + str(type(value)))
+    return tree_map(metadata, (args, kwargs))
+
+
+class _AutogradSACFrame:
+    def __init__(self, policy_fn):
+        self.policy_fn = policy_fn
+        self.entries = []
+        self.cursor = 0
+        self.closed = False
+        self.stats = {"saves": 0, "hits": 0, "recomputes": 0}
+
+
+class _AutogradSACContext:
+    def __init__(self, dispatch_context, frame, is_recompute):
+        self.dispatch_context = dispatch_context
+        self.autograd_frame = frame
+        self.is_recompute = is_recompute
+
+    def __enter__(self):
+        if self.is_recompute and self.autograd_frame.closed:
+            raise RuntimeError("Function SAC cache has already been consumed")
+        self.token = _AUTOGRAD_SAC_CONTEXT.set((self.autograd_frame, self.is_recompute))
+        try:
+            return self.dispatch_context.__enter__()
+        except BaseException:
+            _AUTOGRAD_SAC_CONTEXT.reset(self.token)
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return self.dispatch_context.__exit__(exc_type, exc_value, traceback)
+        finally:
+            if self.is_recompute or exc_type is not None:
+                self.autograd_frame.entries.clear()
+                self.autograd_frame.closed = True
+            _AUTOGRAD_SAC_CONTEXT.reset(self.token)
+
+
+def cache_autograd_forward(function_type, forward_fn, *args, **kwargs):
+    """Cache a deterministic native forward; the enclosing Function still saves its own ctx."""
+    active = _AUTOGRAD_SAC_CONTEXT.get()
+    if active is None:
+        return forward_fn(*args, **kwargs)
+    frame, is_recompute = active
+    policy = frame.policy_fn(
+        SelectiveCheckpointContext(is_recompute=is_recompute), function_type, *args, **kwargs
+    )
+    if isinstance(policy, bool):
+        policy = _policy_from_bool(policy)
+    if policy.name == "MUST_SAVE_OFFLOAD":
+        raise NotImplementedError("Function-level SAC offload is not implemented")
+    if policy.name not in ("MUST_SAVE", "PREFER_SAVE"):
+        if is_recompute:
+            frame.stats["recomputes"] += 1
+        return forward_fn(*args, **kwargs)
+
+    signature = _autograd_signature(args, kwargs)
+    if not is_recompute:
+        result = forward_fn(*args, **kwargs)
+        saved = tree_map(
+            lambda x: _VersionWrapper(x.detach()) if isinstance(x, torch.Tensor) else x,
+            result,
+        )
+        frame.entries.append((function_type, signature, saved))
+        frame.stats["saves"] += 1
+        return result
+
+    if frame.cursor >= len(frame.entries):
+        raise RuntimeError("Function SAC encountered an extra cached call during recompute")
+    saved_type, saved_signature, saved = frame.entries[frame.cursor]
+    if saved_type is not function_type or saved_signature != signature:
+        raise RuntimeError("Function SAC call order or input metadata changed during recompute")
+    result = tree_map(lambda x: x.get_val(False) if isinstance(x, _VersionWrapper) else x, saved)
+    frame.entries[frame.cursor] = None
+    frame.cursor += 1
+    frame.stats["hits"] += 1
+    return result
+
+
 def create_hybrid_checkpoint_contexts(
     policy_fn_or_list, allow_cache_entry_mutation=False
 ):
@@ -403,11 +502,16 @@ def create_hybrid_checkpoint_contexts(
     storage = defaultdict(list)
     offload_info = defaultdict(list)
     tensor_ref = list()
-    return (
+    contexts = (
         _HybridCachingTorchDispatchMode(policy_fn, storage, offload_info, tensor_ref),
         _HybridCachedTorchDispatchMode(policy_fn, storage, allow_cache_entry_mutation),
-        #_CachingTorchDispatchMode(policy_fn, storage),
-        #_CachedTorchDispatchMode(policy_fn, storage, allow_cache_entry_mutation)
+    )
+    if os.environ.get("FASTVIDEO_SAC_AUTOGRAD_CACHE", "0") != "1":
+        return contexts
+    frame = _AutogradSACFrame(policy_fn)
+    return (
+        _AutogradSACContext(contexts[0], frame, False),
+        _AutogradSACContext(contexts[1], frame, True),
     )
 
 

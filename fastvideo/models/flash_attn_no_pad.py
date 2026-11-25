@@ -8,6 +8,8 @@ from flash_attn.bert_padding import pad_input, unpad_input
 
 import torch
 import torch.nn.functional as F
+from functools import partial
+from fastvideo.hybrid_checkpoint import cache_autograd_forward, register_autograd_sac_function
 
 
 def flash_attn_no_pad(qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None):
@@ -34,7 +36,10 @@ class FlashAttnSeparateQKVFunc(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** (-0.5)
         
         # FA 2.8.3.post3 private ABI returns out, lse, mask, and RNG state.
-        out, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+        forward_call = _flash_attn_forward
+        if dropout_p == 0.0:
+            forward_call = partial(cache_autograd_forward, FlashAttnSeparateQKVFunc, _flash_attn_forward)
+        out, softmax_lse, S_dmask, rng_state = forward_call(
             q, k, v,
             dropout_p,
             softmax_scale,
@@ -96,6 +101,9 @@ class FlashAttnSeparateQKVFunc(torch.autograd.Function):
         dv = dqkv[:,:,2,...]
         
         return dq, dk, dv, None, None, None
+
+
+register_autograd_sac_function(FlashAttnSeparateQKVFunc)
 
 
 def flash_attn_no_pad_separate_qkv(q, k, v, key_padding_mask=None, causal=False, dropout_p=0.0, softmax_scale=None):

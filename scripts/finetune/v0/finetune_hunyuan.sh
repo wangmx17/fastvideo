@@ -1,3 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export FASTVIDEO_SAC_AUTOGRAD_CACHE="${FASTVIDEO_SAC_AUTOGRAD_CACHE:-1}"
+export TORCH_MUSA_FSDP2_ENABLE_CE_COMM="${TORCH_MUSA_FSDP2_ENABLE_CE_COMM:-0}"
+export TORCH_MUSA_FSDP2_OVERLAP_LEVEL="${TORCH_MUSA_FSDP2_OVERLAP_LEVEL:-0}"
 export WANDB_BASE_URL="https://api.wandb.ai"
 export WANDB_MODE=online
 #export MUDNN_LOG_LEVEL=INFO
@@ -6,12 +14,12 @@ export WANDB_MODE=disabled
 torchrun --nnodes 1 --nproc_per_node 8 \
     fastvideo/train.py \
     --seed 42 \
-    --pretrained_model_name_or_path /data/yanguo.sun/hunyuan-video/HunyuanVideo/ckpts \
-    --dit_model_name_or_path /data/yanguo.sun/hunyuan-video/HunyuanVideo/ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt \
+    --pretrained_model_name_or_path "${HUNYUAN_MODEL_DIR:-/data/yanguo.sun/hunyuan-video/HunyuanVideo/ckpts}" \
+    --dit_model_name_or_path "${HUNYUAN_DIT_CHECKPOINT:-${HUNYUAN_MODEL_DIR:-/data/yanguo.sun/hunyuan-video/HunyuanVideo/ckpts}/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt}" \
     --model_type "hunyuan" \
-    --cache_dir /data/yanguo.sun/hunyuan-video/.cache \
-    --data_json_path /data/yanguo.sun/hunyuan-video/datasets/videos2caption.json \
-    --validation_prompt_dir /data/yanguo.sun/hunyuan-video/datasets/validation \
+    --cache_dir "${HUNYUAN_CACHE_DIR:-$REPO_ROOT/.cache}" \
+    --data_json_path "${HUNYUAN_DATA_JSON:-/data/yanguo.sun/hunyuan-video/datasets/videos2caption.json}" \
+    --validation_prompt_dir "${HUNYUAN_VALIDATION_DIR:-/data/yanguo.sun/hunyuan-video/datasets/validation}" \
     --train_batch_size=2 \
     --num_latent_t 32 \
     --sp_size 8 \
@@ -30,7 +38,7 @@ torchrun --nnodes 1 --nproc_per_node 8 \
     --cfg 0.0 \
     --ema_decay 0.999 \
     --log_validation \
-    --output_dir=./outputs/OpenVidHD-Finetune-Hunyuan \
+    --output_dir="${HUNYUAN_OUTPUT_DIR:-./outputs/OpenVidHD-Finetune-Hunyuan}" \
     --tracker_project_name OpenVidHD-Finetune-Hunyuan \
     --num_frames 125 \
     --num_height 720 \

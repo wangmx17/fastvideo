@@ -1,6 +1,8 @@
 # !/bin/python3
 # isort: skip_file
 import torch_musa
+import deepspeed
+import transformer_engine.pytorch
 import argparse
 import math
 import os
@@ -332,7 +334,7 @@ def main(args):
         apply_fsdp_checkpointing(transformer, no_split_modules, args.selective_checkpointing)
 
     if args.enable_selective_ac:
-        from hybrid_checkpoint import _apply_selective_ac_to_transformer_block
+        from fastvideo.hybrid_checkpoint import _apply_selective_ac_to_transformer_block
         for idx, block in enumerate(transformer.double_blocks):
             transformer_block = _apply_selective_ac_to_transformer_block(block)
             transformer.double_blocks[idx] = transformer_block
@@ -343,7 +345,7 @@ def main(args):
     if args.enable_hybrid_ac:
         #os.environ["USE_CUSTOM_VARLEN_FA"] = "1"
         # attention: you need to disable gradient checkpoint when enable_hybrid_ac
-        from hybrid_checkpoint import _apply_hybrid_sac_to_transformer_block, set_hybrid_offload_handler
+        from fastvideo.hybrid_checkpoint import _apply_hybrid_sac_to_transformer_block, set_hybrid_offload_handler
         set_hybrid_offload_handler(len(transformer.double_blocks) + len(transformer.single_blocks))
         for idx, block in enumerate(transformer.double_blocks):
             transformer_block = _apply_hybrid_sac_to_transformer_block(block)

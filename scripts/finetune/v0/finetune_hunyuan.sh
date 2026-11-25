@@ -2,6 +2,9 @@ export WANDB_BASE_URL="https://api.wandb.ai"
 export WANDB_MODE=online
 #export MUDNN_LOG_LEVEL=INFO
 export WANDB_MODE=disabled
+# Use MCCL FSDP2 overlap; keep attention CE separate from FSDP CE.
+export TORCH_MUSA_FSDP2_ENABLE_CE_COMM=0
+export TORCH_MUSA_FSDP2_OVERLAP_LEVEL=${TORCH_MUSA_FSDP2_OVERLAP_LEVEL:-1}
 # export TORCH_PROFILING_TRACE=/data/yanguo.sun/hunyuan-video/FastVideo/profiling
 torchrun --nnodes 1 --nproc_per_node 8 \
     fastvideo/train.py \
@@ -40,6 +43,6 @@ torchrun --nnodes 1 --nproc_per_node 8 \
     --use_fused_rmsnorm \
     --use_fused_rope \
     --enable_hybrid_ac \
-    # --fsdp_prefetch_layer 1
+    --fsdp_prefetch_layer "${FSDP_PREFETCH_LAYERS:-1}" \
     #--gradient_checkpointing \
     #--selective_checkpointing 0.99 \

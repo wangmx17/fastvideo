@@ -33,6 +33,35 @@ from fastvideo.utils.communications import all_gather, all_to_all_4D
 from fastvideo.utils.parallel_states import get_sequence_parallel_state, mccl_info
 
 
+class _CastSharedBf16(torch.autograd.Function):
+    """Returns n aliases of x.to(bf16); gradients are accumulated in fp32 as autocast's per-linear casts would."""
+
+    @staticmethod
+    def forward(ctx, x, n):
+        y = x.to(torch.bfloat16)
+        return tuple(y if i == 0 else y.view_as(y) for i in range(n))
+
+    @staticmethod
+    def backward(ctx, *grads):
+        acc = None
+        for g in grads:
+            if g is None:
+                continue
+            acc = g.float() if acc is None else acc.add_(g)
+        return acc, None
+
+
+def _shared_linear_inputs(x, n):
+    """Cast an fp32 activation that feeds n autocast linears to bf16 once instead of once per linear."""
+    if (
+        x.dtype == torch.float32
+        and torch.is_autocast_enabled(x.device.type)
+        and torch.get_autocast_dtype(x.device.type) == torch.bfloat16
+    ):
+        return _CastSharedBf16.apply(x, n)
+    return (x, ) * n
+
+
 def _prehook_split_img_attn_qkv(module, state_dict, prefix, local_metadata,
                                strict, missing_keys, unexpected_keys, error_msgs):
     """
@@ -255,7 +284,8 @@ class MMDoubleStreamBlock(nn.Module):
 
         # ===== Overlap pipeline: compute Q, start async comm, then compute K, etc. =====
         # Compute img_q
-        img_q = self.img_attn_q(img_modulated)
+        img_mod_q, img_mod_k, img_mod_v = _shared_linear_inputs(img_modulated, 3)
+        img_q = self.img_attn_q(img_mod_q)
         img_q = rearrange(img_q, "B L (H D) -> B L H D", H=self.heads_num)
         qkv_type = img_q.dtype
         img_q = self.img_attn_q_norm(img_q).to(qkv_type)
@@ -270,7 +300,7 @@ class MMDoubleStreamBlock(nn.Module):
             query_raw = specific_all_to_all_4D(query, scatter_idx=2, gather_idx=1, alloc_id=0, async_op=True)
         
         # Compute img_k while Q is being communicated
-        img_k = self.img_attn_k(img_modulated)
+        img_k = self.img_attn_k(img_mod_k)
         img_k = rearrange(img_k, "B L (H D) -> B L H D", H=self.heads_num)
         img_k = self.img_attn_k_norm(img_k).to(qkv_type)
         
@@ -284,7 +314,7 @@ class MMDoubleStreamBlock(nn.Module):
             key_raw = specific_all_to_all_4D(key, scatter_idx=2, gather_idx=1, alloc_id=1, async_op=True)
         
         # Compute img_v while K is being communicated
-        img_v = self.img_attn_v(img_modulated)
+        img_v = self.img_attn_v(img_mod_v)
         img_v = rearrange(img_v, "B L (H D) -> B L H D", H=self.heads_num)
         value, encoder_value = img_v, txt_v
 
@@ -455,7 +485,8 @@ class MMSingleStreamBlock(nn.Module):
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
         x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
         
-        q: torch.Tensor = self.linear_q(x_mod)
+        x_mod_q, x_mod_k, x_mod_v, x_mod_mlp = _shared_linear_inputs(x_mod, 4)
+        q: torch.Tensor = self.linear_q(x_mod_q)
         q = rearrange(q, "B L (H D) -> B L H D", H=self.heads_num)
         qkv_type = q.dtype
         q = self.q_norm(q).to(qkv_type)
@@ -469,7 +500,7 @@ class MMSingleStreamBlock(nn.Module):
             query_raw = specific_all_to_all_4D(query, scatter_idx=2, gather_idx=1, alloc_id=0, async_op=True)
         
         
-        k: torch.Tensor = self.linear_k(x_mod)
+        k: torch.Tensor = self.linear_k(x_mod_k)
         k = rearrange(k, "B L (H D) -> B L H D", H=self.heads_num)
         k = self.k_norm(k).to(qkv_type)
         img_k, txt_k = k[:, :-txt_len, :, :], k[:, -txt_len:, :, :]
@@ -482,8 +513,8 @@ class MMSingleStreamBlock(nn.Module):
             key_raw = specific_all_to_all_4D(key, scatter_idx=2, gather_idx=1, alloc_id=1, async_op=True)
             
         
-        v: torch.Tensor = self.linear_v(x_mod)
-        mlp = self.linear_mlp(x_mod)
+        v: torch.Tensor = self.linear_v(x_mod_v)
+        mlp = self.linear_mlp(x_mod_mlp)
         v = rearrange(v, "B L (H D) -> B L H D", H=self.heads_num)
         img_v, txt_v = v[:, :-txt_len, :, :], v[:, -txt_len:, :, :]
         value, encoder_value = img_v, txt_v
